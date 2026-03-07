@@ -88,7 +88,11 @@ for i in range(seed_round):
     num_of_first_train = online_x_train.shape[0]
 
     model = AE(input_dim).to(device)
-    optimizer = torch.optim.SGD(model.parameters(), lr= 0.001)
+    # 1. 使用 AdamW 替换 SGD
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+    # 2. 定义学习率调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
 
     model.train()
     for epoch in range(epochs):
@@ -105,6 +109,8 @@ for i in range(seed_round):
 
             loss.backward()
             optimizer.step()
+        # 增加：在每个 epoch 结束后调用 scheduler.step() 更新学习率
+        scheduler.step()
 
     x_train = x_train.to(device)
     x_test = x_test.to(device)
@@ -147,6 +153,10 @@ for i in range(seed_round):
         
         train_loader = torch.utils.data.DataLoader(
             dataset=train_ds, batch_size=bs, shuffle=True)
+        
+        # 3. 增加：为在线阶段定义降低了学习率的优化器
+        online_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
+        
         model.train()
         for epoch in range(epoch_1):
             print('epoch = ', epoch)
@@ -155,14 +165,16 @@ for i in range(seed_round):
                 inputs = inputs.to(device)
 
                 labels = labels.to(device)
-                optimizer.zero_grad()
+                # 修改：使用 online_optimizer
+                online_optimizer.zero_grad()
 
                 features, recon_vec = model(inputs)
 
                 loss = criterion(features,labels) + criterion(recon_vec,labels)
 
                 loss.backward()
-                optimizer.step()
+                # 修改：使用 online_optimizer
+                online_optimizer.step()
 
 ################### test the performance after online training ###################
     normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
