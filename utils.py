@@ -251,6 +251,10 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     
     if not isinstance(y_test, int):
         result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
+        if get_confidence:
+            return result_encoder, result_decoder, result_final, y_test_pro_en
         return result_encoder, result_decoder, result_final
     else:
+        if get_confidence:
+            return y_test_pred_no_vote, y_test_pro_en
         return y_test_pred_no_vote
