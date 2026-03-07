@@ -88,11 +88,7 @@ for i in range(seed_round):
     num_of_first_train = online_x_train.shape[0]
 
     model = AE(input_dim).to(device)
-    # 1. 使用 AdamW 替换 SGD
-    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    # 2. 定义学习率调度器
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
-
+    optimizer = torch.optim.SGD(model.parameters(), lr= 0.001)
 
     model.train()
     for epoch in range(epochs):
@@ -105,12 +101,12 @@ for i in range(seed_round):
             optimizer.zero_grad()
 
             features, recon_vec = model(inputs)
-            loss = criterion(features,labels) + criterion(recon_vec,labels)
+            alpha = 1.0 # 建议先设置一个超参数alpha，你可以根据效果调整 (如 0.1, 1.0 等)
+            recon_loss = F.mse_loss(recon_vec, inputs)
+            loss = criterion(features,labels) + criterion(recon_vec,labels) + alpha * recon_loss
 
             loss.backward()
             optimizer.step()
-        # 增加：在每个 epoch 结束后调用 scheduler.step() 更新学习率
-        scheduler.step()
 
     x_train = x_train.to(device)
     x_test = x_test.to(device)
@@ -137,11 +133,16 @@ for i in range(seed_round):
         # must compute the normal_temp and normal_recon_temp again, because the model has been updated
         normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
         normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
-        predict_label = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model)
+        predict_label, confidence = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model, get_confidence=True)
 
         y_test_pred_this_epoch = predict_label
         y_train_detection = torch.cat((y_train_detection.to(device), torch.tensor(y_test_pred_this_epoch).to(device)))
-        num_zero = int(flip_percent * y_test_pred_this_epoch.shape[0])
+        
+        # 应用图片中的自适应翻转逻辑
+        avg_confidence = confidence.mean().item()
+        adaptive_flip = max(0.01, flip_percent * (1 - avg_confidence))
+        num_zero = int(adaptive_flip * y_test_pred_this_epoch.shape[0])
+        
         zero_indices = np.random.choice(y_test_pred_this_epoch.shape[0], num_zero, replace=False)
         y_test_pred_this_epoch[zero_indices] = 1 - y_test_pred_this_epoch[zero_indices]
 
@@ -153,10 +154,6 @@ for i in range(seed_round):
         
         train_loader = torch.utils.data.DataLoader(
             dataset=train_ds, batch_size=bs, shuffle=True)
-        
-        # 3. 增加：为在线阶段定义降低了学习率的优化器
-        online_optimizer = torch.optim.AdamW(model.parameters(), lr=1e-4)
-        
         model.train()
         for epoch in range(epoch_1):
             print('epoch = ', epoch)
@@ -165,16 +162,15 @@ for i in range(seed_round):
                 inputs = inputs.to(device)
 
                 labels = labels.to(device)
-                # 修改：使用 online_optimizer
-                online_optimizer.zero_grad()
+                optimizer.zero_grad()
 
                 features, recon_vec = model(inputs)
-
-                loss = criterion(features,labels) + criterion(recon_vec,labels)
-
+                alpha = 1.0 # 保持与上面一致
+                recon_loss = F.mse_loss(recon_vec, inputs)
+                loss = criterion(features,labels) + criterion(recon_vec,labels) + alpha * recon_loss
+                
                 loss.backward()
-                # 修改：使用 online_optimizer
-                online_optimizer.step()
+                optimizer.step()
 
 ################### test the performance after online training ###################
     normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
