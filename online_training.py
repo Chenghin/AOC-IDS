@@ -115,6 +115,24 @@ for i in range(seed_round):
 ####################### start online training #######################
     count = 0
     y_train_detection = y_train_this_epoch
+    
+    def get_features_in_batches(model, x_data, batch_size=256):
+        """分批次通过模型提取特征，防止 OOM"""
+        model.eval() # 切换到推断模式
+        features_list = []
+        recons_list = []
+        
+        # 告诉 PyTorch 不要计算和保存梯度，能省下一大半显存
+        with torch.no_grad():
+            for i in range(0, len(x_data), batch_size):
+                batch_x = x_data[i:i+batch_size]
+                feat, recon = model(batch_x)
+                features_list.append(feat)
+                recons_list.append(recon)
+                
+        # 将分批计算的结果重新拼接起来
+        return torch.cat(features_list, dim=0), torch.cat(recons_list, dim=0)
+    
     while len(x_test_left_epoch) > 0:
         print('seed = ', (seed+i), ', i = ', count)
         count += 1
@@ -129,8 +147,13 @@ for i in range(seed_round):
         test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
 
         # must compute the normal_temp and normal_recon_temp again, because the model has been updated
-        normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
-        normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
+        normal_x = online_x_train[(online_y_train == 0).squeeze()]
+        normal_feats, normal_recons = get_features_in_batches(model, normal_x, batch_size=256)
+        
+        normal_temp = torch.mean(F.normalize(normal_feats, p=2, dim=1), dim=0)
+        normal_recon_temp = torch.mean(F.normalize(normal_recons, p=2, dim=1), dim=0)
+        model.train() # 恢复为训练模式
+        
         predict_label = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model)
 
         y_test_pred_this_epoch = predict_label
