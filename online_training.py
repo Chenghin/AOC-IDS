@@ -27,8 +27,6 @@ parser.add_argument("--gamma_en", type=float, default=1.5)
 parser.add_argument("--gamma_de", type=float, default=1.5)
 
 
-gamma_en = args.gamma_en
-gamma_de = args.gamma_de
 args = parser.parse_args()
 dataset = args.dataset
 epochs = args.epochs
@@ -38,6 +36,8 @@ conf_percentile = args.conf_percentile
 min_keep = args.min_keep
 sample_interval = args.sample_interval
 cuda_num = args.cuda
+gamma_en = args.gamma_en
+gamma_de = args.gamma_de
 
 tem = 0.02
 bs = 128
