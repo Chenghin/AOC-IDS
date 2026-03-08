@@ -21,8 +21,6 @@ parser.add_argument("--percent", type=float, default=0.8)
 parser.add_argument("--flip_percent", type=float, default=0.2)
 parser.add_argument("--sample_interval", type=int, default=2000)
 parser.add_argument("--cuda", type=str, default="0")
-parser.add_argument("--conf_threshold", type=float, default=0.55)
-parser.add_argument("--min_keep_ratio", type=float, default=0.30)
 
 args = parser.parse_args()
 dataset = args.dataset
@@ -32,8 +30,6 @@ percent = args.percent
 flip_percent = args.flip_percent
 sample_interval = args.sample_interval
 cuda_num = args.cuda
-conf_threshold = args.conf_threshold
-min_keep_ratio = args.min_keep_ratio
 
 tem = 0.02
 bs = 128
@@ -54,7 +50,7 @@ if dataset == 'nsl':
 
     # 'labels2' means normal and abnormal, 'labels9' means 'attack_seen', 'attack_unseen', and normal
     # Create an instance of SplitData for 'nsl'
-    splitter_nsl = SplitData(dataset='nsl').fit(KDDTrain, labels='labels2')
+    splitter_nsl = SplitData(dataset='nsl')
     # Transform the data
     x_train, y_train = splitter_nsl.transform(KDDTrain, labels='labels2')
     x_test, y_test = splitter_nsl.transform(KDDTest, labels='labels2')
@@ -66,15 +62,15 @@ else:
     UNSWTest    =  load_data(UNSWTest_dataset_path)
 
     # Create an instance of SplitData for 'unsw'
-    splitter_unsw = SplitData(dataset='unsw').fit(UNSWTrain, labels='label')
+    splitter_unsw = SplitData(dataset='unsw')
 
     # Transform the data
     x_train, y_train = splitter_unsw.transform(UNSWTrain, labels='label')
     x_test, y_test = splitter_unsw.transform(UNSWTest, labels='label')
 
 # Convert to torch tensors
-x_train_all, y_train_all = torch.FloatTensor(x_train), torch.LongTensor(y_train)
-x_test_all, y_test_all = torch.FloatTensor(x_test), torch.LongTensor(y_test)
+x_train, y_train = torch.FloatTensor(x_train), torch.LongTensor(y_train)
+x_test, y_test = torch.FloatTensor(x_test), torch.LongTensor(y_test)
 
 device = torch.device("cuda:"+cuda_num if torch.cuda.is_available() else "cpu")
 
@@ -84,13 +80,7 @@ for i in range(seed_round):
     # Set the seed for the random number generator for this iteration
     setup_seed(seed+i)
 
-    online_x_train, online_x_test, online_y_train, online_y_test = train_test_split(
-    x_train_all,
-    y_train_all,
-    test_size=percent,
-    random_state=seed+i,
-    stratify=y_train_all,
-)
+    online_x_train, online_x_test, online_y_train, online_y_test = train_test_split(x_train, y_train, test_size=percent, random_state=seed+i)
     train_ds = TensorDataset(online_x_train, online_y_train)
     train_loader = torch.utils.data.DataLoader(
         dataset=train_ds, batch_size=bs, shuffle=True)
@@ -116,15 +106,11 @@ for i in range(seed_round):
             loss.backward()
             optimizer.step()
 
-        online_x_train = online_x_train.to(device)
-        online_y_train = online_y_train.to(device)
-        x_test_all_device = x_test_all.to(device)
-        y_test_all_device = y_test_all.to(device)
+    x_train = x_train.to(device)
+    x_test = x_test.to(device)
+    online_x_train, online_y_train  = online_x_train.to(device), online_y_train.to(device)
 
-        x_train_this_epoch = online_x_train.clone()
-        x_test_left_epoch = online_x_test.clone().to(device)
-        y_train_this_epoch = online_y_train.clone()
-        y_test_left_epoch = online_y_test.clone()
+    x_train_this_epoch, x_test_left_epoch, y_train_this_epoch, y_test_left_epoch = online_x_train.clone(), online_x_test.clone().to(device), online_y_train.clone(), online_y_test.clone()
 
 ####################### start online training #######################
     count = 0
@@ -140,61 +126,22 @@ for i in range(seed_round):
             x_test_this_epoch = x_test_left_epoch[:sample_interval].clone()
             x_test_left_epoch = x_test_left_epoch[sample_interval:]
 
-        with torch.no_grad():
-            model.eval()
-            normal_features, normal_recons = model(online_x_train[(online_y_train == 0).squeeze()])
-            normal_temp = F.normalize(normal_features, p=2, dim=1).mean(dim=0)
-            normal_recon_temp = F.normalize(normal_recons, p=2, dim=1).mean(dim=0)
-        model.train()
-        predict_label, predict_confidence = evaluate(
-            normal_temp,
-            normal_recon_temp,
-            x_train_this_epoch,
-            y_train_detection,
-            x_test_this_epoch,
-            0,
-            model,
-            get_confidence=True
-        )
+        test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
 
-        y_test_pred_this_epoch = predict_label.copy()
-        keep_mask_np = select_high_confidence(
-            predict_confidence,
-            threshold=conf_threshold,
-            min_keep_ratio=min_keep_ratio
-        )
+        # must compute the normal_temp and normal_recon_temp again, because the model has been updated
+        normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
+        normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
+        predict_label = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model)
 
-        keep_count = int(keep_mask_np.sum())
-        total_count = int(len(y_test_pred_this_epoch))
+        y_test_pred_this_epoch = predict_label
+        y_train_detection = torch.cat((y_train_detection.to(device), torch.tensor(y_test_pred_this_epoch).to(device)))
+        num_zero = int(flip_percent * y_test_pred_this_epoch.shape[0])
+        zero_indices = np.random.choice(y_test_pred_this_epoch.shape[0], num_zero, replace=False)
+        y_test_pred_this_epoch[zero_indices] = 1 - y_test_pred_this_epoch[zero_indices]
 
-        print(
-            f"keep pseudo labels: {keep_count}/{total_count}, "
-            f"chunk_conf_mean={predict_confidence.mean():.4f}, "
-            f"selected_conf_mean={predict_confidence[keep_mask_np].mean():.4f}"
-        )
-
-        keep_mask = torch.from_numpy(keep_mask_np).to(device)
-
-        # 只保留高置信度样本进入后续检测/训练池
-        x_selected = x_test_this_epoch[keep_mask]
-        y_selected_detection = torch.from_numpy(
-            y_test_pred_this_epoch[keep_mask_np]
-        ).long().to(device)
-
-        # detection 用未翻转的伪标签
-        x_train_this_epoch = torch.cat((x_train_this_epoch, x_selected))
-        y_train_detection = torch.cat((y_train_detection, y_selected_detection))
-
-        # training 用加噪后的伪标签
-        y_selected_train = y_selected_detection.clone()
-
-        num_flip = int(flip_percent * y_selected_train.shape[0])
-        if num_flip > 0:
-            flip_idx = np.random.choice(y_selected_train.shape[0], num_flip, replace=False)
-            flip_idx = torch.from_numpy(flip_idx).long().to(device)
-            y_selected_train[flip_idx] = 1 - y_selected_train[flip_idx]
-
-        y_train_this_epoch = torch.cat((y_train_this_epoch, y_selected_train))
+        x_train_this_epoch = torch.cat((x_train_this_epoch.to(device), x_test_this_epoch.to(device)))
+        y_train_this_epoch_temp = y_train_this_epoch.clone()
+        y_train_this_epoch = torch.cat((y_train_this_epoch_temp.to(device), torch.tensor(y_test_pred_this_epoch).to(device)))
 
         train_ds = TensorDataset(x_train_this_epoch, y_train_this_epoch)
         
@@ -218,18 +165,7 @@ for i in range(seed_round):
                 optimizer.step()
 
 ################### test the performance after online training ###################
-    with torch.no_grad():
-        model.eval()
-        normal_features, normal_recons = model(online_x_train[(online_y_train == 0).squeeze()])
-        normal_temp = F.normalize(normal_features, p=2, dim=1).mean(dim=0)
-        normal_recon_temp = F.normalize(normal_recons, p=2, dim=1).mean(dim=0)
+    normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
+    normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
 
-    res_en, res_de, res_final = evaluate(
-        normal_temp,
-        normal_recon_temp,
-        x_train_this_epoch,
-        y_train_detection,
-        x_test_all_device,
-        y_test_all_device,
-        model
-    )
+    res_en, res_de, res_final = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test, y_test, model)
