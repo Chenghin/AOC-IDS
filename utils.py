@@ -15,19 +15,6 @@ import scipy.optimize as opt
 import torch.distributions as dist
 from sklearn.metrics import accuracy_score
 
-def get_features_in_batches(model, x_data, batch_size=256):
-    """分批次通过模型提取特征，防止 Transformer 爆显存"""
-    model.eval()
-    features_list = []
-    recons_list = []
-    with torch.no_grad():
-        for i in range(0, len(x_data), batch_size):
-            batch_x = x_data[i:i+batch_size]
-            feat, recon = model(batch_x)
-            features_list.append(feat)
-            recons_list.append(recon)
-    return torch.cat(features_list, dim=0), torch.cat(recons_list, dim=0)
-
 def load_data(data_path):
     data = pd.read_csv(data_path)
     return data
@@ -68,64 +55,34 @@ def description(data):
     print("Dimension of data set ",data.shape)
 
 class AE(nn.Module):
-    def __init__(self, input_dim, d_model=16, nhead=4, num_layers=2):
+    def __init__(self, input_dim):
         super(AE, self).__init__()
 
-        self.input_dim = input_dim
-        self.d_model = d_model
-
-        # 保留原有的维度计算逻辑，确保与外部 loss 和 decision-making 兼容
+        # Find the nearest power of 2 to input_dim
         nearest_power_of_2 = 2 ** round(math.log2(input_dim))
+
+        # Calculate the dimensions of the 2nd/4th layer and the 3rd layer.
         second_fourth_layer_size = nearest_power_of_2 // 2  # A half
         third_layer_size = nearest_power_of_2 // 4         # A quarter
 
-        # 1. 特征词嵌入 (Feature Embedding)
-        # 将每个一维的标量特征映射为 d_model 维的稠密向量
-        self.feature_embedding = nn.Linear(1, d_model)
-
-        # 2. Transformer 编码器 (Self-Attention)
-        # batch_first=True 确保输入格式为 [batch_size, seq_len, feature_dim]
-        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-        # 3. 降维压缩 (Compress to Bottleneck)
-        # 将 Transformer 提取出的序列特征展平，并压缩到原有的 third_layer_size
-        self.compress = nn.Sequential(
-            nn.Linear(input_dim * d_model, second_fourth_layer_size),
+        # Create encoder
+        self.encoder = nn.Sequential(
+            nn.Linear(input_dim, second_fourth_layer_size),
             nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, third_layer_size)
+            nn.Linear(second_fourth_layer_size, third_layer_size),
         )
 
-        # 4. 解码器 (Decoder)
-        # 保持与原结构类似的重建逻辑
+        # Create decoder
         self.decoder = nn.Sequential(
             nn.ReLU(),
             nn.Linear(third_layer_size, second_fourth_layer_size),
             nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, input_dim)
+            nn.Linear(second_fourth_layer_size, input_dim),
         )
 
     def forward(self, x):
-        # x 的原始 shape: [batch_size, input_dim]
-
-        # 扩充维度以适配 Embedding 层: 变成 [batch_size, input_dim, 1]
-        x_expanded = x.unsqueeze(-1)
-
-        # 1. 经过特征嵌入: shape 变为 [batch_size, input_dim, d_model]
-        x_embed = self.feature_embedding(x_expanded)
-
-        # 2. 经过 Transformer 提取特征交互: shape 保持 [batch_size, input_dim, d_model]
-        x_transformed = self.transformer_encoder(x_embed)
-
-        # 3. 展平特征: shape 变为 [batch_size, input_dim * d_model]
-        x_flat = x_transformed.reshape(x.size(0), -1)
-
-        # 4. 获取低维的特征表征 (用于对比学习和高斯拟合)
-        encode = self.compress(x_flat)
-
-        # 5. 重建原始输入
+        encode = self.encoder(x)
         decode = self.decoder(encode)
-
         return encode, decode
 
 class CRCLoss(nn.Module):
@@ -205,17 +162,10 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     x_train_normal = x_train[(y_train == 0).squeeze()]
     x_train_abnormal = x_train[(y_train == 1).squeeze()]
 
-    # === 核心修改：用批量函数一次性提取所有需要的 raw 特征，大幅减少重复计算和显存占用 ===
-    train_feat_raw, train_recon_raw = get_features_in_batches(model, x_train, batch_size=256)
-    train_feat_norm_raw, train_recon_norm_raw = get_features_in_batches(model, x_train_normal, batch_size=256)
-    train_feat_abnorm_raw, train_recon_abnorm_raw = get_features_in_batches(model, x_train_abnormal, batch_size=256)
-    test_feat_raw, test_recon_raw = get_features_in_batches(model, x_test, batch_size=256)
-
-    # 1. 归一化 Encoder 特征 (替代了原代码前 4 次直接调用 model 的操作)
-    train_features = F.normalize(train_feat_raw, p=2, dim=1)
-    train_features_normal = F.normalize(train_feat_norm_raw, p=2, dim=1)
-    train_features_abnormal = F.normalize(train_feat_abnorm_raw, p=2, dim=1)
-    test_features = F.normalize(test_feat_raw, p=2, dim=1)
+    train_features = F.normalize(model(x_train)[num_of_layer], p=2, dim=1)
+    train_features_normal = F.normalize(model(x_train_normal)[num_of_layer], p=2, dim=1)
+    train_features_abnormal = F.normalize(model(x_train_abnormal)[num_of_layer], p=2, dim=1)
+    test_features = F.normalize(model(x_test)[num_of_layer], p=2, dim=1)
 
     values_features_all, indcies = torch.sort(F.cosine_similarity(train_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
     values_features_normal, indcies = torch.sort(F.cosine_similarity(train_features_normal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
@@ -225,12 +175,11 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
 
     values_features_test = F.cosine_similarity(test_features, normal_temp.reshape([-1, normal_temp.shape[0]]))
 
-    # 2. 归一化 Decoder 重建特征 (替代了原代码后 4 次直接调用 model 的操作)
     num_of_output = 1
-    train_recon = F.normalize(train_recon_raw, p=2, dim=1)
-    train_recon_normal = F.normalize(train_recon_norm_raw, p=2, dim=1)
-    train_recon_abnormal = F.normalize(train_recon_abnorm_raw, p=2, dim=1)
-    test_recon = F.normalize(test_recon_raw, p=2, dim=1)
+    train_recon = F.normalize(model(x_train)[num_of_output], p=2, dim=1)
+    train_recon_normal = F.normalize(model(x_train_normal)[num_of_output], p=2, dim=1)
+    train_recon_abnormal = F.normalize(model(x_train_abnormal)[num_of_output], p=2, dim=1)
+    test_recon = F.normalize(model(x_test)[num_of_output], p=2, dim=1)
 
     values_recon_all, indcies = torch.sort(F.cosine_similarity(train_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
     values_recon_normal, indcies = torch.sort(F.cosine_similarity(train_recon_normal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
@@ -298,10 +247,23 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
         result_encoder = score_detail(y_test, y_test_pred_2)
         result_decoder = score_detail(y_test, y_test_pred_4)
 
-    y_test_pred_no_vote = torch.where(torch.from_numpy(y_test_pro_en) > torch.from_numpy(y_test_pro_de), torch.from_numpy(y_test_pred_2), torch.from_numpy(y_test_pred_4))
-    
+    en_conf_t = torch.from_numpy(y_test_pro_en)
+    de_conf_t = torch.from_numpy(y_test_pro_de)
+
+    y_test_pred_no_vote = torch.where(
+        en_conf_t > de_conf_t,
+        torch.from_numpy(y_test_pred_2),
+        torch.from_numpy(y_test_pred_4)
+    )
+
+    final_confidence = torch.where(en_conf_t > de_conf_t, en_conf_t, de_conf_t).numpy()
+
     if not isinstance(y_test, int):
         result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
+        if get_confidence:
+            return result_encoder, result_decoder, result_final, final_confidence
         return result_encoder, result_decoder, result_final
     else:
-        return y_test_pred_no_vote
+        if get_confidence:
+            return y_test_pred_no_vote.numpy(), final_confidence
+        return y_test_pred_no_vote.numpy()
