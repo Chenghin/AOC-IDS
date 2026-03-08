@@ -18,7 +18,7 @@ parser.add_argument("--dataset", type=str, default='nsl')
 parser.add_argument("--epochs", type=int, default=4)
 parser.add_argument("--epoch_1", type=int, default=1)
 parser.add_argument("--percent", type=float, default=0.8)
-parser.add_argument("--flip_percent", type=float, default=0.2)
+parser.add_argument("--conf_threshold", type=float, default=0.95)
 parser.add_argument("--sample_interval", type=int, default=2000)
 parser.add_argument("--cuda", type=str, default="0")
 
@@ -27,7 +27,7 @@ dataset = args.dataset
 epochs = args.epochs
 epoch_1 = args.epoch_1
 percent = args.percent
-flip_percent = args.flip_percent
+conf_threshold = args.conf_threshold
 sample_interval = args.sample_interval
 cuda_num = args.cuda
 
@@ -115,24 +115,6 @@ for i in range(seed_round):
 ####################### start online training #######################
     count = 0
     y_train_detection = y_train_this_epoch
-    
-    def get_features_in_batches(model, x_data, batch_size=256):
-        """分批次通过模型提取特征，防止 OOM"""
-        model.eval() # 切换到推断模式
-        features_list = []
-        recons_list = []
-        
-        # 告诉 PyTorch 不要计算和保存梯度，能省下一大半显存
-        with torch.no_grad():
-            for i in range(0, len(x_data), batch_size):
-                batch_x = x_data[i:i+batch_size]
-                feat, recon = model(batch_x)
-                features_list.append(feat)
-                recons_list.append(recon)
-                
-        # 将分批计算的结果重新拼接起来
-        return torch.cat(features_list, dim=0), torch.cat(recons_list, dim=0)
-    
     while len(x_test_left_epoch) > 0:
         print('seed = ', (seed+i), ', i = ', count)
         count += 1
@@ -144,29 +126,47 @@ for i in range(seed_round):
             x_test_this_epoch = x_test_left_epoch[:sample_interval].clone()
             x_test_left_epoch = x_test_left_epoch[sample_interval:]
 
-        test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
+        # test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
 
         # must compute the normal_temp and normal_recon_temp again, because the model has been updated
-        normal_x = online_x_train[(online_y_train == 0).squeeze()]
-        normal_feats, normal_recons = get_features_in_batches(model, normal_x, batch_size=256)
+        normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
+        normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
         
-        normal_temp = torch.mean(F.normalize(normal_feats, p=2, dim=1), dim=0)
-        normal_recon_temp = torch.mean(F.normalize(normal_recons, p=2, dim=1), dim=0)
-        model.train() # 恢复为训练模式
-        
-        predict_label = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test_this_epoch, 0, model)
+        predict_label, predict_confidence = evaluate(
+            normal_temp,
+            normal_recon_temp,
+            x_train_this_epoch,
+            y_train_detection,
+            x_test_this_epoch,
+            0,
+            model,
+            get_confidence=True
+        )
 
-        y_test_pred_this_epoch = predict_label
-        y_train_detection = torch.cat((y_train_detection.to(device), torch.tensor(y_test_pred_this_epoch).to(device)))
-        num_zero = int(flip_percent * y_test_pred_this_epoch.shape[0])
-        zero_indices = np.random.choice(y_test_pred_this_epoch.shape[0], num_zero, replace=False)
-        y_test_pred_this_epoch[zero_indices] = 1 - y_test_pred_this_epoch[zero_indices]
+        y_test_pred_this_epoch = torch.tensor(predict_label, dtype=torch.long, device=device)
+        predict_confidence = torch.tensor(predict_confidence, dtype=torch.float32, device=device)
 
-        x_train_this_epoch = torch.cat((x_train_this_epoch.to(device), x_test_this_epoch.to(device)))
+        # 只接收高置信伪标签
+        high_conf_mask = predict_confidence >= conf_threshold
+
+        # 如果这一轮一个高置信样本都没有，就跳过更新，继续下一批
+        if high_conf_mask.sum().item() == 0:
+            print(f'No pseudo labels accepted in this round. threshold={conf_threshold}')
+            continue
+
+        accepted_x = x_test_this_epoch[high_conf_mask]
+        accepted_y = y_test_pred_this_epoch[high_conf_mask]
+
+        # detection 用的标签集合，也只加入高置信样本
+        y_train_detection = torch.cat((y_train_detection.to(device), accepted_y))
+
+        # 训练集也只加入高置信样本
+        x_train_this_epoch = torch.cat((x_train_this_epoch.to(device), accepted_x.to(device)))
         y_train_this_epoch_temp = y_train_this_epoch.clone()
-        y_train_this_epoch = torch.cat((y_train_this_epoch_temp.to(device), torch.tensor(y_test_pred_this_epoch).to(device)))
+        y_train_this_epoch = torch.cat((y_train_this_epoch_temp.to(device), accepted_y))
 
         train_ds = TensorDataset(x_train_this_epoch, y_train_this_epoch)
+        
         
         train_loader = torch.utils.data.DataLoader(
             dataset=train_ds, batch_size=bs, shuffle=True)
