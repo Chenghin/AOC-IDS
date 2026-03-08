@@ -207,11 +207,16 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
         gaussian2 = dist.Normal(mu1_fit, sigma1_fit)
         gaussian1 = dist.Normal(mu2_fit, sigma2_fit)
 
-    pdf1 = gaussian1.log_prob(values_features_test).exp()
+    eps = 1e-12
 
+    pdf1 = gaussian1.log_prob(values_features_test).exp()
     pdf2 = gaussian2.log_prob(values_features_test).exp()
-    y_test_pred_2 = (pdf2 > pdf1).cpu().numpy().astype("int32")
-    y_test_pro_en = (torch.abs(pdf2-pdf1)).cpu().detach().numpy().astype("float32")
+
+    p_en_normal = pdf1 / (pdf1 + pdf2 + eps)
+    p_en_abnormal = pdf2 / (pdf1 + pdf2 + eps)
+
+    y_test_pred_2 = (p_en_abnormal > p_en_normal).cpu().numpy().astype("int32")
+    y_test_pro_en = torch.maximum(p_en_normal, p_en_abnormal).cpu().detach().numpy().astype("float32")
 
     if isinstance(y_test, int) == False:
         if y_test.device != torch.device("cpu"):
@@ -236,10 +241,13 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
         gaussian3 = dist.Normal(mu4_fit, sigma4_fit)
 
     pdf3 = gaussian3.log_prob(values_recon_test).exp()
-
     pdf4 = gaussian4.log_prob(values_recon_test).exp()
-    y_test_pred_4 = (pdf4 > pdf3).cpu().numpy().astype("int32")
-    y_test_pro_de = (torch.abs(pdf4-pdf3)).cpu().detach().numpy().astype("float32")
+
+    p_de_normal = pdf3 / (pdf3 + pdf4 + eps)
+    p_de_abnormal = pdf4 / (pdf3 + pdf4 + eps)
+
+    y_test_pred_4 = (p_de_abnormal > p_de_normal).cpu().numpy().astype("int32")
+    y_test_pro_de = torch.maximum(p_de_normal, p_de_abnormal).cpu().detach().numpy().astype("float32")
 
     if not isinstance(y_test, int):
         if y_test.device != torch.device("cpu"):
