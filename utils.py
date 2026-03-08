@@ -11,7 +11,8 @@ import math
 import torch.nn as nn
 import torch.nn.functional as F
 from sklearn.metrics import accuracy_score,confusion_matrix, precision_score, recall_score, f1_score
-from sklearn.mixture import GaussianMixture
+import scipy.optimize as opt
+import torch.distributions as dist
 from sklearn.metrics import accuracy_score
 
 def load_data(data_path):
@@ -22,36 +23,31 @@ class SplitData(BaseEstimator, TransformerMixin):
     def __init__(self, dataset):
         super(SplitData, self).__init__()
         self.dataset = dataset
-        self.scaler = MinMaxScaler()
-        self._is_fitted = False
 
-    def _split_xy(self, X, labels):
+    def fit(self, X, y=None):
+        return self 
+    
+    def transform(self, X, labels, one_hot_label=True):
         if self.dataset == 'nsl':
-            y = (X[labels] != 'normal').astype('float32').to_numpy()
+            # Preparing the labels
+            y = X[labels]
             X_ = X.drop(['labels5', 'labels2'], axis=1)
+            # abnormal data is labeled as 1, normal data 0
+            y = (y != 'normal')
+            y_ = np.asarray(y).astype('float32')
 
         elif self.dataset == 'unsw':
-            y = X[labels].astype('float32').to_numpy()
+            # UNSW dataset processing
+            y_ = X[labels]
             X_ = X.drop('label', axis=1)
 
         else:
             raise ValueError("Unsupported dataset type")
 
-        return X_, y
+        # Normalization
+        normalize = MinMaxScaler().fit(X_)
+        x_ = normalize.transform(X_)
 
-    def fit(self, X, labels, y=None):
-        X_, _ = self._split_xy(X, labels)
-        self.scaler.fit(X_)
-        self._is_fitted = True
-        return self
-
-    def transform(self, X, labels, one_hot_label=True):
-        X_, y_ = self._split_xy(X, labels)
-
-        if not self._is_fitted:
-            self.fit(X, labels)
-
-        x_ = self.scaler.transform(X_)
         return x_, y_
 
 def description(data):
@@ -59,34 +55,64 @@ def description(data):
     print("Dimension of data set ",data.shape)
 
 class AE(nn.Module):
-    def __init__(self, input_dim):
+    def __init__(self, input_dim, d_model=16, nhead=4, num_layers=2):
         super(AE, self).__init__()
 
-        # Find the nearest power of 2 to input_dim
-        nearest_power_of_2 = 2 ** round(math.log2(input_dim))
+        self.input_dim = input_dim
+        self.d_model = d_model
 
-        # Calculate the dimensions of the 2nd/4th layer and the 3rd layer.
+        # 保留原有的维度计算逻辑，确保与外部 loss 和 decision-making 兼容
+        nearest_power_of_2 = 2 ** round(math.log2(input_dim))
         second_fourth_layer_size = nearest_power_of_2 // 2  # A half
         third_layer_size = nearest_power_of_2 // 4         # A quarter
 
-        # Create encoder
-        self.encoder = nn.Sequential(
-            nn.Linear(input_dim, second_fourth_layer_size),
+        # 1. 特征词嵌入 (Feature Embedding)
+        # 将每个一维的标量特征映射为 d_model 维的稠密向量
+        self.feature_embedding = nn.Linear(1, d_model)
+
+        # 2. Transformer 编码器 (Self-Attention)
+        # batch_first=True 确保输入格式为 [batch_size, seq_len, feature_dim]
+        encoder_layer = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, batch_first=True)
+        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+        # 3. 降维压缩 (Compress to Bottleneck)
+        # 将 Transformer 提取出的序列特征展平，并压缩到原有的 third_layer_size
+        self.compress = nn.Sequential(
+            nn.Linear(input_dim * d_model, second_fourth_layer_size),
             nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, third_layer_size),
+            nn.Linear(second_fourth_layer_size, third_layer_size)
         )
 
-        # Create decoder
+        # 4. 解码器 (Decoder)
+        # 保持与原结构类似的重建逻辑
         self.decoder = nn.Sequential(
             nn.ReLU(),
             nn.Linear(third_layer_size, second_fourth_layer_size),
             nn.ReLU(),
-            nn.Linear(second_fourth_layer_size, input_dim),
+            nn.Linear(second_fourth_layer_size, input_dim)
         )
 
     def forward(self, x):
-        encode = self.encoder(x)
+        # x 的原始 shape: [batch_size, input_dim]
+
+        # 扩充维度以适配 Embedding 层: 变成 [batch_size, input_dim, 1]
+        x_expanded = x.unsqueeze(-1)
+
+        # 1. 经过特征嵌入: shape 变为 [batch_size, input_dim, d_model]
+        x_embed = self.feature_embedding(x_expanded)
+
+        # 2. 经过 Transformer 提取特征交互: shape 保持 [batch_size, input_dim, d_model]
+        x_transformed = self.transformer_encoder(x_embed)
+
+        # 3. 展平特征: shape 变为 [batch_size, input_dim * d_model]
+        x_flat = x_transformed.reshape(x.size(0), -1)
+
+        # 4. 获取低维的特征表征 (用于对比学习和高斯拟合)
+        encode = self.compress(x_flat)
+
+        # 5. 重建原始输入
         decode = self.decoder(encode)
+
         return encode, decode
 
 class CRCLoss(nn.Module):
@@ -96,42 +122,37 @@ class CRCLoss(nn.Module):
         self.temperature = temperature
         self.scale_by_temperature = scale_by_temperature
 
-    def forward(self, features, labels=None, mask=None):
+    def forward(self, features, labels=None, mask=None):        
         features = F.normalize(features, p=2, dim=1)
         batch_size = features.shape[0]
-        labels = labels.contiguous().view(-1)
-
+        labels = labels.contiguous().view(-1, 1)
         if labels.shape[0] != batch_size:
             raise ValueError('Num of labels does not match num of features')
-
-        normal_mask = labels == 0
-        abnormal_mask = labels > 0
-
-        # CRC loss 至少需要: 2 个 normal（形成正对）+ 1 个 abnormal（形成负对）
-        if normal_mask.sum() < 2 or abnormal_mask.sum() < 1:
-            return features.sum() * 0.0
-
-        logits = torch.matmul(features, features.T) / self.temperature
-        logits = logits - logits.max(dim=1, keepdim=True).values.detach()
-
-        normal_logits = logits[normal_mask]  # [n_normal, batch_size]
-
-        # 去掉 self-pair
-        self_mask = torch.eye(batch_size, device=features.device, dtype=torch.bool)[normal_mask]
-        positive_mask = normal_mask.unsqueeze(0).expand(normal_logits.size(0), -1) & (~self_mask)
-        negative_mask = abnormal_mask.unsqueeze(0).expand(normal_logits.size(0), -1)
-
-        positive_logits = normal_logits[positive_mask]
-        negative_logits = normal_logits[negative_mask]
-
-        sum_neg = torch.exp(negative_logits).sum().clamp_min(1e-12)
-        log_denom = torch.logaddexp(positive_logits, torch.log(sum_neg))
-        loss = -(positive_logits - log_denom)
-
+        mask = torch.eq(labels, labels.T).float()
+        # compute logits
+        logits = torch.div(
+            torch.matmul(features, features.T),
+            self.temperature)  # Calculate the dot product similarity between pairwise samples
+        # create mask 
+        logits_mask = torch.ones_like(mask).to(self.device) - torch.eye(batch_size).to(self.device)  
+        logits_without_ii = logits * logits_mask
+        
+        logits_normal = logits_without_ii[(labels == 0).squeeze()]
+        logits_normal_normal = logits_normal[:,(labels == 0).squeeze()]
+        logits_normal_abnormal = logits_normal[:,(labels > 0).squeeze()]
+        
+        ## This is the denominator for InfoNCE loss: ONE time of traversal
+        # sum_of_vium = torch.sum(torch.exp(logits_normal_abnormal), axis=1, keepdims=True)
+        ## This is the denominator for our proposed CRC loss: TWO times of traversal
+        sum_of_vium = torch.sum(torch.exp(logits_normal_abnormal))
+        denominator = torch.exp(logits_normal_normal) + sum_of_vium
+        log_probs = logits_normal_normal - torch.log(denominator)
+  
+        loss = -log_probs
         if self.scale_by_temperature:
-            loss = loss * self.temperature
-
-        return loss.mean()
+            loss *= self.temperature
+        loss = loss.mean()
+        return loss
     
 def score_detail(y_test,y_test_pred,if_print=False):
     # Confusion matrix
@@ -156,148 +177,16 @@ def setup_seed(seed):
      random.seed(seed)
      torch.backends.cudnn.deterministic = True
 
-def _normalized_outputs(model, x):
-    features, recon = model(x)
-    return F.normalize(features, p=2, dim=1), F.normalize(recon, p=2, dim=1)
+def gaussian_pdf(x, mu, sigma):
+    return (1 / (np.sqrt(2 * np.pi) * sigma)) * np.exp(-0.5 * ((x - mu) / sigma) ** 2)
 
-
-def _fit_gmm_from_scores(all_scores, normal_scores, abnormal_scores):
-    all_scores = np.asarray(all_scores, dtype=np.float64).reshape(-1, 1)
-    normal_scores = np.asarray(normal_scores, dtype=np.float64).reshape(-1)
-    abnormal_scores = np.asarray(abnormal_scores, dtype=np.float64).reshape(-1)
-
-    means_init = np.array([
-        [normal_scores.mean()],
-        [abnormal_scores.mean()],
-    ], dtype=np.float64)
-
-    gmm = GaussianMixture(
-        n_components=2,
-        covariance_type='full',
-        reg_covar=1e-6,
-        means_init=means_init,
-        weights_init=np.array([0.5, 0.5], dtype=np.float64),
-        random_state=0,
-        max_iter=200,
-    )
-    gmm.fit(all_scores)
-
-    means = gmm.means_.reshape(-1)
-    normal_idx = int(np.argmax(means))   # cosine 越大越像 normal
-    abnormal_idx = 1 - normal_idx
-    return gmm, normal_idx, abnormal_idx
-
-
-def _predict_with_gmm(gmm, normal_idx, abnormal_idx, test_scores):
-    test_scores = np.asarray(test_scores, dtype=np.float64).reshape(-1, 1)
-    probs = gmm.predict_proba(test_scores)
-
-    p_normal = probs[:, normal_idx]
-    p_abnormal = probs[:, abnormal_idx]
-
-    y_pred = (p_abnormal > p_normal).astype(np.int32)
-    confidence = np.abs(p_abnormal - p_normal).astype(np.float32)
-    return y_pred, confidence
-
-def select_high_confidence(confidence, threshold=0.55, min_keep_ratio=0.30):
-    confidence = np.asarray(confidence, dtype=np.float32)
-    n = confidence.shape[0]
-
-    if n == 0:
-        return np.array([], dtype=bool)
-
-    min_keep = max(1, int(np.ceil(min_keep_ratio * n)))
-
-    keep_mask = confidence >= threshold
-
-    # 如果阈值筛出来太少，就至少保留 top-k
-    if keep_mask.sum() < min_keep:
-        topk_idx = np.argsort(confidence)[-min_keep:]
-        keep_mask = np.zeros(n, dtype=bool)
-        keep_mask[topk_idx] = True
-
-    return keep_mask
+def log_likelihood(params, data):
+    mu1, sigma1, mu2, sigma2 = params
+    pdf1 = gaussian_pdf(data, mu1, sigma1)
+    pdf2 = gaussian_pdf(data, mu2, sigma2)
+    return -np.sum(np.log(0.5 * pdf1 + 0.5 * pdf2))
 
 def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model, get_confidence=False, en_or_de=False):
-    y_train = y_train.view(-1)
-    normal_mask = y_train == 0
-    abnormal_mask = y_train == 1
-
-    if normal_mask.sum().item() == 0 or abnormal_mask.sum().item() == 0:
-        raise ValueError("y_train 里必须同时包含 normal(0) 和 abnormal(1) 才能做双高斯拟合。")
-
-    was_training = model.training
-    model.eval()
-
-    with torch.no_grad():
-        train_features, train_recon = _normalized_outputs(model, x_train)
-        test_features, test_recon = _normalized_outputs(model, x_test)
-
-        normal_temp = F.normalize(normal_temp.view(1, -1), p=2, dim=1)
-        normal_recon_temp = F.normalize(normal_recon_temp.view(1, -1), p=2, dim=1)
-
-        values_features_all = F.cosine_similarity(train_features, normal_temp, dim=1).cpu().numpy()
-        values_features_normal = F.cosine_similarity(train_features[normal_mask], normal_temp, dim=1).cpu().numpy()
-        values_features_abnormal = F.cosine_similarity(train_features[abnormal_mask], normal_temp, dim=1).cpu().numpy()
-        values_features_test = F.cosine_similarity(test_features, normal_temp, dim=1).cpu().numpy()
-
-        values_recon_all = F.cosine_similarity(train_recon, normal_recon_temp, dim=1).cpu().numpy()
-        values_recon_normal = F.cosine_similarity(train_recon[normal_mask], normal_recon_temp, dim=1).cpu().numpy()
-        values_recon_abnormal = F.cosine_similarity(train_recon[abnormal_mask], normal_recon_temp, dim=1).cpu().numpy()
-        values_recon_test = F.cosine_similarity(test_recon, normal_recon_temp, dim=1).cpu().numpy()
-
-    if was_training:
-        model.train()
-
-    gmm_en, en_normal_idx, en_abnormal_idx = _fit_gmm_from_scores(
-        values_features_all,
-        values_features_normal,
-        values_features_abnormal,
-    )
-    y_test_pred_2, y_test_pro_en = _predict_with_gmm(
-        gmm_en,
-        en_normal_idx,
-        en_abnormal_idx,
-        values_features_test,
-    )
-
-    gmm_de, de_normal_idx, de_abnormal_idx = _fit_gmm_from_scores(
-        values_recon_all,
-        values_recon_normal,
-        values_recon_abnormal,
-    )
-    y_test_pred_4, y_test_pro_de = _predict_with_gmm(
-        gmm_de,
-        de_normal_idx,
-        de_abnormal_idx,
-        values_recon_test,
-    )
-
-    y_test_pred_no_vote = np.where(
-        y_test_pro_en > y_test_pro_de,
-        y_test_pred_2,
-        y_test_pred_4,
-    ).astype(np.int32)
-
-    final_confidence = np.maximum(y_test_pro_en, y_test_pro_de).astype(np.float32)
-
-    if not isinstance(y_test, int):
-        if torch.is_tensor(y_test):
-            y_test = y_test.detach().cpu().numpy()
-
-        result_encoder = score_detail(y_test, y_test_pred_2)
-        result_decoder = score_detail(y_test, y_test_pred_4)
-        result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
-
-        if get_confidence:
-            return result_encoder, result_decoder, result_final, final_confidence
-
-        return result_encoder, result_decoder, result_final
-
-    if get_confidence:
-        return y_test_pred_no_vote, final_confidence
-
-    return y_test_pred_no_vote
     num_of_layer = 0
 
     x_train_normal = x_train[(y_train == 0).squeeze()]
