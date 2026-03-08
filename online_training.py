@@ -10,6 +10,7 @@ from utils import *
 
 import argparse
 import warnings
+import copy
 
 warnings.filterwarnings('ignore')
 
@@ -18,7 +19,8 @@ parser.add_argument("--dataset", type=str, default='nsl')
 parser.add_argument("--epochs", type=int, default=4)
 parser.add_argument("--epoch_1", type=int, default=1)
 parser.add_argument("--percent", type=float, default=0.8)
-parser.add_argument("--conf_threshold", type=float, default=0.95)
+parser.add_argument("--conf_percentile", type=float, default=0.8)
+parser.add_argument("--min_keep", type=int, default=64)
 parser.add_argument("--sample_interval", type=int, default=2000)
 parser.add_argument("--cuda", type=str, default="0")
 
@@ -27,7 +29,8 @@ dataset = args.dataset
 epochs = args.epochs
 epoch_1 = args.epoch_1
 percent = args.percent
-conf_threshold = args.conf_threshold
+conf_percentile = args.conf_percentile
+min_keep = args.min_keep
 sample_interval = args.sample_interval
 cuda_num = args.cuda
 
@@ -105,6 +108,10 @@ for i in range(seed_round):
 
             loss.backward()
             optimizer.step()
+            
+    teacher_model = copy.deepcopy(model).to(device)
+    teacher_model.eval()
+    ema_decay = 0.999
 
     x_train = x_train.to(device)
     x_test = x_test.to(device)
@@ -126,47 +133,54 @@ for i in range(seed_round):
             x_test_this_epoch = x_test_left_epoch[:sample_interval].clone()
             x_test_left_epoch = x_test_left_epoch[sample_interval:]
 
-        # test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
+        test_features = F.normalize(model(x_test_this_epoch)[0], p=2, dim=1)
 
         # must compute the normal_temp and normal_recon_temp again, because the model has been updated
-        normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
-        normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
-        
-        predict_label, predict_confidence = evaluate(
+        normal_temp = torch.mean(
+            F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1),
+            dim=0
+        )
+        normal_recon_temp = torch.mean(
+            F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1),
+            dim=0
+        )
+
+        predict_label, predict_conf, predict_src = evaluate(
             normal_temp,
             normal_recon_temp,
             x_train_this_epoch,
             y_train_detection,
             x_test_this_epoch,
             0,
-            model,
+            teacher_model,
             get_confidence=True
         )
+        
+        predict_label = predict_label.to(device)
+        predict_conf = predict_conf.to(device)
 
-        y_test_pred_this_epoch = torch.tensor(predict_label, dtype=torch.long, device=device)
-        predict_confidence = torch.tensor(predict_confidence, dtype=torch.float32, device=device)
+        # ===== 只保留高置信伪标签 =====
+        conf_threshold = torch.quantile(predict_conf, conf_percentile)
+        keep_mask = predict_conf >= conf_threshold
 
-        # 只接收高置信伪标签
-        high_conf_mask = predict_confidence >= conf_threshold
+        # 防止筛完一个都不剩
+        if keep_mask.sum().item() < min_keep:
+            topk = min(min_keep, predict_conf.shape[0])
+            _, topk_idx = torch.topk(predict_conf, k=topk, largest=True)
+            keep_mask = torch.zeros_like(predict_conf, dtype=torch.bool)
+            keep_mask[topk_idx] = True
 
-        # 如果这一轮一个高置信样本都没有，就跳过更新，继续下一批
-        if high_conf_mask.sum().item() == 0:
-            print(f'No pseudo labels accepted in this round. threshold={conf_threshold}')
-            continue
+        x_keep = x_test_this_epoch[keep_mask]
+        y_keep = predict_label[keep_mask]
 
-        accepted_x = x_test_this_epoch[high_conf_mask]
-        accepted_y = y_test_pred_this_epoch[high_conf_mask]
+        # detection 分支只追加高置信标签
+        y_train_detection = torch.cat((y_train_detection.to(device), y_keep))
 
-        # detection 用的标签集合，也只加入高置信样本
-        y_train_detection = torch.cat((y_train_detection.to(device), accepted_y))
-
-        # 训练集也只加入高置信样本
-        x_train_this_epoch = torch.cat((x_train_this_epoch.to(device), accepted_x.to(device)))
-        y_train_this_epoch_temp = y_train_this_epoch.clone()
-        y_train_this_epoch = torch.cat((y_train_this_epoch_temp.to(device), accepted_y))
+        # 训练集也只追加高置信样本
+        x_train_this_epoch = torch.cat((x_train_this_epoch.to(device), x_keep.to(device)))
+        y_train_this_epoch = torch.cat((y_train_this_epoch.to(device), y_keep))
 
         train_ds = TensorDataset(x_train_this_epoch, y_train_this_epoch)
-        
         
         train_loader = torch.utils.data.DataLoader(
             dataset=train_ds, batch_size=bs, shuffle=True)
@@ -186,6 +200,11 @@ for i in range(seed_round):
 
                 loss.backward()
                 optimizer.step()
+        
+        with torch.no_grad():
+            for t_param, s_param in zip(teacher_model.parameters(), model.parameters()):
+                t_param.data.mul_(ema_decay).add_(s_param.data, alpha=1 - ema_decay)
+        teacher_model.eval()
 
 ################### test the performance after online training ###################
     normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
