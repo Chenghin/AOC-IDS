@@ -23,7 +23,12 @@ parser.add_argument("--conf_percentile", type=float, default=0.8)
 parser.add_argument("--min_keep", type=int, default=64)
 parser.add_argument("--sample_interval", type=int, default=2000)
 parser.add_argument("--cuda", type=str, default="0")
+parser.add_argument("--gamma_en", type=float, default=1.5)
+parser.add_argument("--gamma_de", type=float, default=1.5)
 
+
+gamma_en = args.gamma_en
+gamma_de = args.gamma_de
 args = parser.parse_args()
 dataset = args.dataset
 epochs = args.epochs
@@ -152,8 +157,10 @@ for i in range(seed_round):
             y_train_detection,
             x_test_this_epoch,
             0,
-            teacher_model,
-            get_confidence=True
+            model,
+            get_confidence=True,
+            gamma_en=gamma_en,
+            gamma_de=gamma_de
         )
         
         predict_label = predict_label.to(device)
@@ -210,4 +217,14 @@ for i in range(seed_round):
     normal_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[0], p=2, dim=1), dim=0)
     normal_recon_temp = torch.mean(F.normalize(model(online_x_train[(online_y_train == 0).squeeze()])[1], p=2, dim=1), dim=0)
 
-    res_en, res_de, res_final = evaluate(normal_temp, normal_recon_temp, x_train_this_epoch, y_train_detection, x_test, y_test, model)
+    res_en, res_de, res_final = evaluate(
+    normal_temp,
+    normal_recon_temp,
+    x_train_this_epoch,
+    y_train_detection,
+    x_test,
+    y_test,
+    model,
+    gamma_en=gamma_en,
+    gamma_de=gamma_de
+)
