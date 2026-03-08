@@ -167,13 +167,20 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     train_features_abnormal = F.normalize(model(x_train_abnormal)[num_of_layer], p=2, dim=1)
     test_features = F.normalize(model(x_test)[num_of_layer], p=2, dim=1)
 
-    values_features_all, indcies = torch.sort(F.cosine_similarity(train_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
-    values_features_normal, indcies = torch.sort(F.cosine_similarity(train_features_normal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
-    values_features_abnormal, indcies = torch.sort(F.cosine_similarity(train_features_abnormal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
+    values_features_all, _ = torch.sort(
+        F.cosine_similarity(train_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1)
+    )
+    values_features_normal, _ = torch.sort(
+        F.cosine_similarity(train_features_normal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1)
+    )
+    values_features_abnormal, _ = torch.sort(
+        F.cosine_similarity(train_features_abnormal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1)
+    )
 
     values_features_all = values_features_all.cpu().detach().numpy()
-
-    values_features_test = F.cosine_similarity(test_features, normal_temp.reshape([-1, normal_temp.shape[0]]))
+    values_features_test = F.cosine_similarity(
+        test_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1
+    )
 
     num_of_output = 1
     train_recon = F.normalize(model(x_train)[num_of_output], p=2, dim=1)
@@ -181,61 +188,70 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     train_recon_abnormal = F.normalize(model(x_train_abnormal)[num_of_output], p=2, dim=1)
     test_recon = F.normalize(model(x_test)[num_of_output], p=2, dim=1)
 
-    values_recon_all, indcies = torch.sort(F.cosine_similarity(train_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
-    values_recon_normal, indcies = torch.sort(F.cosine_similarity(train_recon_normal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
-    values_recon_abnormal, indcies = torch.sort(F.cosine_similarity(train_recon_abnormal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
+    values_recon_all, _ = torch.sort(
+        F.cosine_similarity(train_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1)
+    )
+    values_recon_normal, _ = torch.sort(
+        F.cosine_similarity(train_recon_normal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1)
+    )
+    values_recon_abnormal, _ = torch.sort(
+        F.cosine_similarity(train_recon_abnormal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1)
+    )
 
     values_recon_all = values_recon_all.cpu().detach().numpy()
+    values_recon_test = F.cosine_similarity(
+        test_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1
+    )
 
-    values_recon_test = F.cosine_similarity(test_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1)
-
+    # ===== encoder branch =====
     mu1_initial = np.mean(values_features_normal.cpu().detach().numpy())
     sigma1_initial = np.std(values_features_normal.cpu().detach().numpy())
 
     mu2_initial = np.mean(values_features_abnormal.cpu().detach().numpy())
     sigma2_initial = np.std(values_features_abnormal.cpu().detach().numpy())
 
-    # Fitting data to two Gaussian distributions using Maximum Likelihood Estimation (MLE)
-    initial_params = np.array([mu1_initial, sigma1_initial, mu2_initial, sigma2_initial]) # Initial parameters
+    initial_params = np.array([mu1_initial, sigma1_initial, mu2_initial, sigma2_initial])
     result = opt.minimize(log_likelihood, initial_params, args=(values_features_all,), method='Nelder-Mead')
-    mu1_fit, sigma1_fit, mu2_fit, sigma2_fit = result.x # Estimated parameter values
+    mu1_fit, sigma1_fit, mu2_fit, sigma2_fit = result.x
+
+    # 防止 sigma 为 0 或负数
+    sigma1_fit = max(float(abs(sigma1_fit)), 1e-6)
+    sigma2_fit = max(float(abs(sigma2_fit)), 1e-6)
 
     if mu1_fit > mu2_fit:
-        gaussian1 = dist.Normal(mu1_fit, sigma1_fit)
-        gaussian2 = dist.Normal(mu2_fit, sigma2_fit)
+        gaussian1 = dist.Normal(mu1_fit, sigma1_fit)  # normal
+        gaussian2 = dist.Normal(mu2_fit, sigma2_fit)  # abnormal
     else:
         gaussian2 = dist.Normal(mu1_fit, sigma1_fit)
         gaussian1 = dist.Normal(mu2_fit, sigma2_fit)
 
-    eps = 1e-12
-
     pdf1 = gaussian1.log_prob(values_features_test).exp()
     pdf2 = gaussian2.log_prob(values_features_test).exp()
 
-    p_en_normal = pdf1 / (pdf1 + pdf2 + eps)
-    p_en_abnormal = pdf2 / (pdf1 + pdf2 + eps)
-
-    y_test_pred_2 = (p_en_abnormal > p_en_normal).cpu().numpy().astype("int32")
-    y_test_pro_en = torch.maximum(p_en_normal, p_en_abnormal).cpu().detach().numpy().astype("float32")
+    y_test_pred_2 = (pdf2 > pdf1).long()
+    y_test_pro_en = torch.abs(pdf2 - pdf1).float()
 
     if isinstance(y_test, int) == False:
         if y_test.device != torch.device("cpu"):
             y_test = y_test.cpu().numpy()
 
+    # ===== decoder branch =====
     mu3_initial = np.mean(values_recon_normal.cpu().detach().numpy())
     sigma3_initial = np.std(values_recon_normal.cpu().detach().numpy())
 
     mu4_initial = np.mean(values_recon_abnormal.cpu().detach().numpy())
     sigma4_initial = np.std(values_recon_abnormal.cpu().detach().numpy())
 
-    # Fitting data to two Gaussian distributions using Maximum Likelihood Estimation (MLE)
-    initial_params = np.array([mu3_initial, sigma3_initial, mu4_initial, sigma4_initial]) # Initial parameters
+    initial_params = np.array([mu3_initial, sigma3_initial, mu4_initial, sigma4_initial])
     result = opt.minimize(log_likelihood, initial_params, args=(values_recon_all,), method='Nelder-Mead')
-    mu3_fit, sigma3_fit, mu4_fit, sigma4_fit = result.x # Estimated parameter values
+    mu3_fit, sigma3_fit, mu4_fit, sigma4_fit = result.x
+
+    sigma3_fit = max(float(abs(sigma3_fit)), 1e-6)
+    sigma4_fit = max(float(abs(sigma4_fit)), 1e-6)
 
     if mu3_fit > mu4_fit:
-        gaussian3 = dist.Normal(mu3_fit, sigma3_fit)
-        gaussian4 = dist.Normal(mu4_fit, sigma4_fit)
+        gaussian3 = dist.Normal(mu3_fit, sigma3_fit)  # normal
+        gaussian4 = dist.Normal(mu4_fit, sigma4_fit)  # abnormal
     else:
         gaussian4 = dist.Normal(mu3_fit, sigma3_fit)
         gaussian3 = dist.Normal(mu4_fit, sigma4_fit)
@@ -243,35 +259,27 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     pdf3 = gaussian3.log_prob(values_recon_test).exp()
     pdf4 = gaussian4.log_prob(values_recon_test).exp()
 
-    p_de_normal = pdf3 / (pdf3 + pdf4 + eps)
-    p_de_abnormal = pdf4 / (pdf3 + pdf4 + eps)
-
-    y_test_pred_4 = (p_de_abnormal > p_de_normal).cpu().numpy().astype("int32")
-    y_test_pro_de = torch.maximum(p_de_normal, p_de_abnormal).cpu().detach().numpy().astype("float32")
+    y_test_pred_4 = (pdf4 > pdf3).long()
+    y_test_pro_de = torch.abs(pdf4 - pdf3).float()
 
     if not isinstance(y_test, int):
-        if y_test.device != torch.device("cpu"):
-            y_test = y_test.cpu().numpy()
-        result_encoder = score_detail(y_test, y_test_pred_2)
-        result_decoder = score_detail(y_test, y_test_pred_4)
+        result_encoder = score_detail(y_test, y_test_pred_2.cpu().numpy())
+        result_decoder = score_detail(y_test, y_test_pred_4.cpu().numpy())
 
-    en_conf_t = torch.from_numpy(y_test_pro_en)
-    de_conf_t = torch.from_numpy(y_test_pro_de)
-
-    y_test_pred_no_vote = torch.where(
-        en_conf_t > de_conf_t,
-        torch.from_numpy(y_test_pred_2),
-        torch.from_numpy(y_test_pred_4)
+    # ===== final select by higher confidence =====
+    use_encoder = y_test_pro_en > y_test_pro_de
+    y_test_pred_no_vote = torch.where(use_encoder, y_test_pred_2, y_test_pred_4)
+    final_conf = torch.where(use_encoder, y_test_pro_en, y_test_pro_de)
+    final_src = torch.where(
+        use_encoder,
+        torch.zeros_like(y_test_pred_no_vote),   # 0: encoder
+        torch.ones_like(y_test_pred_no_vote)     # 1: decoder
     )
 
-    final_confidence = torch.where(en_conf_t > de_conf_t, en_conf_t, de_conf_t).numpy()
-
     if not isinstance(y_test, int):
-        result_final = score_detail(y_test, y_test_pred_no_vote, if_print=True)
-        if get_confidence:
-            return result_encoder, result_decoder, result_final, final_confidence
+        result_final = score_detail(y_test, y_test_pred_no_vote.cpu().numpy(), if_print=True)
         return result_encoder, result_decoder, result_final
     else:
         if get_confidence:
-            return y_test_pred_no_vote.numpy(), final_confidence
-        return y_test_pred_no_vote.numpy()
+            return y_test_pred_no_vote, final_conf, final_src
+        return y_test_pred_no_vote
