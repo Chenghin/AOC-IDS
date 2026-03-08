@@ -158,7 +158,10 @@ def log_likelihood(params, data):
 
 def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model,
              get_confidence=False, en_or_de=False, gamma_en=1.5, gamma_de=1.5):
-
+                 
+    num_of_layer = 0
+    num_of_output = 1
+                 
     x_train_normal = x_train[(y_train == 0).squeeze()]
     x_train_abnormal = x_train[(y_train == 1).squeeze()]
 
