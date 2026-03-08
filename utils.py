@@ -15,6 +15,19 @@ import scipy.optimize as opt
 import torch.distributions as dist
 from sklearn.metrics import accuracy_score
 
+def get_features_in_batches(model, x_data, batch_size=256):
+    """分批次通过模型提取特征，防止 Transformer 爆显存"""
+    model.eval()
+    features_list = []
+    recons_list = []
+    with torch.no_grad():
+        for i in range(0, len(x_data), batch_size):
+            batch_x = x_data[i:i+batch_size]
+            feat, recon = model(batch_x)
+            features_list.append(feat)
+            recons_list.append(recon)
+    return torch.cat(features_list, dim=0), torch.cat(recons_list, dim=0)
+
 def load_data(data_path):
     data = pd.read_csv(data_path)
     return data
@@ -192,10 +205,17 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     x_train_normal = x_train[(y_train == 0).squeeze()]
     x_train_abnormal = x_train[(y_train == 1).squeeze()]
 
-    train_features = F.normalize(model(x_train)[num_of_layer], p=2, dim=1)
-    train_features_normal = F.normalize(model(x_train_normal)[num_of_layer], p=2, dim=1)
-    train_features_abnormal = F.normalize(model(x_train_abnormal)[num_of_layer], p=2, dim=1)
-    test_features = F.normalize(model(x_test)[num_of_layer], p=2, dim=1)
+    # === 核心修改：用批量函数一次性提取所有需要的 raw 特征，大幅减少重复计算和显存占用 ===
+    train_feat_raw, train_recon_raw = get_features_in_batches(model, x_train, batch_size=256)
+    train_feat_norm_raw, train_recon_norm_raw = get_features_in_batches(model, x_train_normal, batch_size=256)
+    train_feat_abnorm_raw, train_recon_abnorm_raw = get_features_in_batches(model, x_train_abnormal, batch_size=256)
+    test_feat_raw, test_recon_raw = get_features_in_batches(model, x_test, batch_size=256)
+
+    # 1. 归一化 Encoder 特征 (替代了原代码前 4 次直接调用 model 的操作)
+    train_features = F.normalize(train_feat_raw, p=2, dim=1)
+    train_features_normal = F.normalize(train_feat_norm_raw, p=2, dim=1)
+    train_features_abnormal = F.normalize(train_feat_abnorm_raw, p=2, dim=1)
+    test_features = F.normalize(test_feat_raw, p=2, dim=1)
 
     values_features_all, indcies = torch.sort(F.cosine_similarity(train_features, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
     values_features_normal, indcies = torch.sort(F.cosine_similarity(train_features_normal, normal_temp.reshape([-1, normal_temp.shape[0]]), dim=1))
@@ -205,11 +225,12 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
 
     values_features_test = F.cosine_similarity(test_features, normal_temp.reshape([-1, normal_temp.shape[0]]))
 
+    # 2. 归一化 Decoder 重建特征 (替代了原代码后 4 次直接调用 model 的操作)
     num_of_output = 1
-    train_recon = F.normalize(model(x_train)[num_of_output], p=2, dim=1)
-    train_recon_normal = F.normalize(model(x_train_normal)[num_of_output], p=2, dim=1)
-    train_recon_abnormal = F.normalize(model(x_train_abnormal)[num_of_output], p=2, dim=1)
-    test_recon = F.normalize(model(x_test)[num_of_output], p=2, dim=1)
+    train_recon = F.normalize(train_recon_raw, p=2, dim=1)
+    train_recon_normal = F.normalize(train_recon_norm_raw, p=2, dim=1)
+    train_recon_abnormal = F.normalize(train_recon_abnorm_raw, p=2, dim=1)
+    test_recon = F.normalize(test_recon_raw, p=2, dim=1)
 
     values_recon_all, indcies = torch.sort(F.cosine_similarity(train_recon, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
     values_recon_normal, indcies = torch.sort(F.cosine_similarity(train_recon_normal, normal_recon_temp.reshape([-1, normal_recon_temp.shape[0]]), dim=1))
