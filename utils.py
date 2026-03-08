@@ -156,8 +156,8 @@ def log_likelihood(params, data):
     pdf2 = gaussian_pdf(data, mu2, sigma2)
     return -np.sum(np.log(0.5 * pdf1 + 0.5 * pdf2))
 
-def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model, get_confidence=False, en_or_de=False):
-    num_of_layer = 0
+def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, model,
+             get_confidence=False, en_or_de=False, gamma_en=1.5, gamma_de=1.5):
 
     x_train_normal = x_train[(y_train == 0).squeeze()]
     x_train_abnormal = x_train[(y_train == 1).squeeze()]
@@ -228,8 +228,11 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     pdf1 = gaussian1.log_prob(values_features_test).exp()
     pdf2 = gaussian2.log_prob(values_features_test).exp()
 
-    y_test_pred_2 = (pdf2 > pdf1).long()
-    y_test_pro_en = torch.abs(pdf2 - pdf1).float()
+    ratio_en = pdf2 / (pdf1 + 1e-12)
+    y_test_pred_2 = (ratio_en > gamma_en).long()
+
+    # 置信度改成 log-ratio 更稳定
+    y_test_pro_en = torch.abs(torch.log(pdf2 + 1e-12) - torch.log(pdf1 + 1e-12)).float()
 
     if isinstance(y_test, int) == False:
         if y_test.device != torch.device("cpu"):
@@ -259,9 +262,11 @@ def evaluate(normal_temp, normal_recon_temp, x_train, y_train, x_test, y_test, m
     pdf3 = gaussian3.log_prob(values_recon_test).exp()
     pdf4 = gaussian4.log_prob(values_recon_test).exp()
 
-    y_test_pred_4 = (pdf4 > pdf3).long()
-    y_test_pro_de = torch.abs(pdf4 - pdf3).float()
+    ratio_de = pdf4 / (pdf3 + 1e-12)
+    y_test_pred_4 = (ratio_de > gamma_de).long()
 
+    y_test_pro_de = torch.abs(torch.log(pdf4 + 1e-12) - torch.log(pdf3 + 1e-12)).float()
+    
     if not isinstance(y_test, int):
         result_encoder = score_detail(y_test, y_test_pred_2.cpu().numpy())
         result_decoder = score_detail(y_test, y_test_pred_4.cpu().numpy())
